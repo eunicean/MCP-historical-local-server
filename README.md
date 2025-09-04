@@ -12,7 +12,7 @@ pip install fastmcp
 ```
 pymongo
 ```
-pip instal pymongo
+pip install pymongo
 ```
 
 
@@ -22,7 +22,7 @@ Para descargar librerías necesarias para mcp:
 py -m uv add "mcp[cli]"
 ```
 
-Para instalar automaticamente el servidor sin tener que configurar el claude_config.json se necesita usar el comando:
+Para instalar automaticamente el servidor sin tener que configurar el claude_desktop_config.json se necesita usar el comando:
 ```
 py -m uv run mcp install historical_mcp.py
 ```
