@@ -14,6 +14,10 @@ pymongo
 ```
 pip install pymongo
 ```
+anthropic
+```
+pip install anthropic
+```
 
 
 ## Usar con Claude Desktop
