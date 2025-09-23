@@ -2,26 +2,24 @@ import os
 import anthropic
 import json
 import sys
+import asyncio
 from typing import List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv, dotenv_values
+from fastmcp import Client
 
 load_dotenv()
 
 LOG_PATH = "MCPchatlog.json"
 
 API_KEY = os.getenv("APIKEY")
-if not API_KEY:
-    print("Error: no se encontró la API key. Define APIKEY en .env (o ANTHROPIC_API_KEY).")
-    sys.exit(1)
-
 MODEL = "claude-3-haiku-20240307"
 MAX_HISTORY_MESSAGES = 30 # mensajes de contexto
 
 client = anthropic.Anthropic(api_key=API_KEY)
 
 def now_iso():
-    return datetime.utcnow().isoformat() + "Z"
+    return datetime.now(timezone.utc).isoformat()
 
 def load_logs(path: str = LOG_PATH) -> List[Dict[str, Any]]:
     if not os.path.exists(path):
@@ -44,10 +42,9 @@ def append_log(entry: Dict[str, Any], path: str = LOG_PATH):
 
 def build_history_from_logs(logs: List[Dict[str, Any]], max_messages: int = MAX_HISTORY_MESSAGES):
     msgs = []
-    # Selecciona solo entradas con role user/assistant
     for e in [x for x in logs if x.get("role") in ("user", "assistant")]:
         msgs.append({"role": e["role"], "content": e["content"]})
-    # Mantener solo las últimas max_messages
+    # mantener solo las últimas max_messages
     return msgs[-max_messages:]
 
 def safe_extract_response_text(response) -> str:
@@ -56,22 +53,20 @@ def safe_extract_response_text(response) -> str:
         content = getattr(response, "content", None)
         if isinstance(content, str):
             return content
-        # si es lista de objetos
+        # es lista de objetos
         if isinstance(content, (list, tuple)) and len(content) > 0:
             first = content[0]
-            # varios SDKs usan .text ó .content en el item
+            # .text o .content en el item
             if isinstance(first, dict):
                 # busca claves conocidas
                 for k in ("text", "content", "output_text"):
                     if k in first:
                         return first[k]
-                # fallback
                 return json.dumps(first)
             # si es objeto con attr .text
             if hasattr(first, "text"):
                 return first.text
             return str(first)
-        # fallback último recurso
         return str(response)
     except Exception:
         return str(response)
@@ -81,7 +76,6 @@ def send_to_claude(history: List[Dict[str,str]], user_input: str, model: str = M
     Envía la conversación (history + user_input) a Claude y retorna el texto de respuesta.
     history: lista de {"role":"user"/"assistant", "content": "..."}
     """
-    # construir mensajes: usar el historial ya existente y añadir el nuevo user message al final
     messages = history + [{"role": "user", "content": user_input}]
     try:
         resp = client.messages.create(
@@ -96,7 +90,7 @@ def send_to_claude(history: List[Dict[str,str]], user_input: str, model: str = M
     return reply_text
 
 def show_history(history: List[Dict[str,str]]):
-    print("---- contexto (últimos mensajes) ----")
+    print("---- CONTEXTO (últimos mensajes) ----")
     for m in history:
         role = m.get("role", "?")
         content = m.get("content", "")
@@ -104,12 +98,46 @@ def show_history(history: List[Dict[str,str]]):
         print(f"{prefix} {content}")
     print("------------------------------------")
 
-def main():
+# MCP ----------------------------------------------------------
+def serialize_mcp_result(result):
+    """Convierte cualquier resultado de MCP en algo serializable JSON."""
+    try:
+        if hasattr(result, "structured_content") and result.structured_content is not None:
+            return result.structured_content
+        if hasattr(result, "content") and result.content is not None:
+            return [str(c) for c in result.content]
+        return str(result)
+    except Exception as e:
+        return {"error": str(e), "raw": str(result)}
+
+async def run_tool(query: str):
+    client = Client("historical_mcp.py")
+
+    async with client:
+        print("Sesión MCP abierta")
+
+        result = await client.call_tool("find_event", {"title": query})
+        response = result.structured_content if hasattr(result, "structured_content") else str(result)
+
+        append_log({
+            "time": now_iso(),
+            "role": "MCP",
+            "tool": "find_event",
+            "request": {"title": query},
+            "response": response
+        })
+
+        return response
+
+# MCP ----------------------------------------------------------
+
+async def main():
     logs = load_logs()
     history = build_history_from_logs(logs)
 
-    print("Chatbot con Claude (Punto 1). Escribe 'exit' para salir.")
-    print("Comandos especiales: /history (ver contexto), /log (abrir archivo de log), /clear (limpiar contexto actual y log).")
+    print("Chatbot  historical mcp")
+    print("Comandos: /history, /log, /clear, /find_event <query>, exit")
+
     while True:
         try:
             user_input = input("Tú: ").strip()
@@ -120,45 +148,40 @@ def main():
         if not user_input:
             continue
         if user_input.lower() in ("exit", "quit"):
-            print("Adiós.")
             break
 
         if user_input == "/history":
-            show_history(history)
+            for h in history:
+                role = "Tú" if h["role"] == "user" else "Claude"
+                print(f"{role}: {h['content']}")
             continue
         if user_input == "/log":
-            print(f"Log guardado en: {os.path.abspath(LOG_PATH)}")
+            print(f"Log: {os.path.abspath(LOG_PATH)}")
             continue
         if user_input == "/clear":
-            confirm = input("¿Seguro? Esto borrará el log en disco y el contexto actual. (s/N): ").strip().lower()
-            if confirm == "s":
-                save_logs([])
-                history = []
-                print("Contexto y log limpiados.")
+            save_logs([])
+            history = []
+            print(" Log y contexto limpiados.")
             continue
 
-        # Log de la entrada del usuario
-        entry_user = {"time": now_iso(), "role": "user", "content": user_input, "meta": {}}
-        append_log(entry_user)
+        if user_input.startswith("/find_event"):
+            query = user_input.replace("/find_event", "").strip()
+            results = await run_tool(query)
+            print("📚 Resultados:", results)
+            continue
+
+        append_log({"time": now_iso(), "role": "user", "content": user_input})
         history.append({"role": "user", "content": user_input})
 
         try:
             reply = send_to_claude(history, user_input)
         except RuntimeError as e:
-            print(f"[ERROR] {e}")
-            # Guardar error en log
-            append_log({"time": now_iso(), "role": "assistant", "content": f"ERROR: {e}", "meta": {"error": True}})
+            print(e)
             continue
 
-        # Mostrar y loggear la respuesta
         print("Claude:", reply)
-        entry_assistant = {"time": now_iso(), "role": "assistant", "content": reply, "meta": {"model": MODEL}}
-        append_log(entry_assistant)
+        append_log({"time": now_iso(), "role": "assistant", "content": reply})
         history.append({"role": "assistant", "content": reply})
 
-        # Mantener el tamaño del contexto (por mensajes)
-        if len(history) > MAX_HISTORY_MESSAGES:
-            history = history[-MAX_HISTORY_MESSAGES:]
-
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
